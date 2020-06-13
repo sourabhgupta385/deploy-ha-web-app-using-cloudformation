@@ -1,0 +1,199 @@
+Description: This template deploys the servers and other resources for Udagram web application.
+
+Parameters:
+    EnvironmentName:
+        Description: This name will be prefixed to all the resources.
+        Type: String
+    ServerAMIId:
+        Description: AMI ID for EC2 instances.
+        Type: String
+    InstanceType:
+        Description: EC2 instance type
+        Type: String
+
+Resources:
+    ## Security Groups ##
+
+    # Security Group for Load Balancer
+    LBSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow http to our load balancer
+            VpcId:
+                Fn::ImportValue: !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress: #Allowing inbound traffic on port 80
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+            SecurityGroupEgress: #Allowing outbound traffic on port 80
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+
+    # Security group for Udagram app servers
+    WebServerSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            GroupDescription: Allow http to our hosts and SSH from local only
+            VpcId:
+                Fn::ImportValue: !Sub "${EnvironmentName}-VPCID"
+            SecurityGroupIngress: #Allowing inbound traffic on port 80 for accessing application and on port 22 for SSH in case of troubleshooting any issues.
+                - IpProtocol: tcp
+                  FromPort: 80
+                  ToPort: 80
+                  CidrIp: 0.0.0.0/0
+                - IpProtocol: tcp
+                  FromPort: 22
+                  ToPort: 22
+                  CidrIp: 0.0.0.0/0
+            SecurityGroupEgress: # Allowing outbound traffic on all ports so that updates or patches can be downloaded.
+                - IpProtocol: tcp
+                  FromPort: 0
+                  ToPort: 65535
+                  CidrIp: 0.0.0.0/0
+
+    ## IAM Roles and Policies ##
+
+    # An IAM role that allows ec2 to list.
+    S3BucketsRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service:
+                              - ec2.amazonaws.com
+                      Action:
+                          - sts:AssumeRole
+            Path: "/"
+
+    # An IAM instance profile
+    S3BucketsInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: "/"
+            Roles:
+                - Ref: S3BucketsRole
+
+    # An IAM policy that allows EC2 to list items in S3
+    S3BucketsPolicy:
+        Type: AWS::IAM::Policy
+        Properties:
+            PolicyName: S3BucketsPolicy
+            PolicyDocument:
+                Statement:
+                    - Effect: Allow
+                      Action:
+                          - s3:*
+                      Resource: "*"
+            Roles:
+                - Ref: S3BucketsRole
+
+    ## Launch Configuration ##
+
+    # Launch configuration that will be used when server will spin up.
+    WebAppLaunchConfig:
+        Type: AWS::AutoScaling::LaunchConfiguration
+        Properties:
+            UserData:
+                Fn::Base64: !Sub |
+                    #!/bin/bash
+                    apt-get update -y
+                    apt-get install unzip awscli -y
+                    apt-get install apache2 -y
+                    systemctl start apache2.service
+                    cd /var/www/html
+                    aws s3 cp s3://udagram-webapp/index.html .
+            ImageId: !Ref ServerAMIId
+            IamInstanceProfile: !Ref S3BucketsInstanceProfile
+            SecurityGroups:
+                - Ref: WebServerSecurityGroup
+            InstanceType: !Ref InstanceType
+            BlockDeviceMappings:
+                - DeviceName: "/dev/sdk"
+                  Ebs:
+                      VolumeSize: "10"
+
+    ## Auto Scaling Group ##
+
+    # Auto scaling group for Udagram App
+    WebAppGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            VPCZoneIdentifier:
+                - Fn::ImportValue: !Sub "${EnvironmentName}-PRI-NETS"
+            LaunchConfigurationName:
+                Ref: WebAppLaunchConfig
+            MinSize: "4"
+            MaxSize: "6"
+            TargetGroupARNs:
+                - Ref: WebAppTargetGroup
+
+    ## Load Balancer ##
+
+    # Load balancer for public subnets with load balancer security group attached
+    WebAppLB:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties:
+            Subnets:
+                - Fn::ImportValue: !Sub "${EnvironmentName}-PUB-SN01"
+                - Fn::ImportValue: !Sub "${EnvironmentName}-PUB-SN02"
+            SecurityGroups:
+                - Ref: LBSecurityGroup
+
+    ## Load Balancer Listner ##
+
+    Listener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+                - Type: forward
+                  TargetGroupArn:
+                      Ref: WebAppTargetGroup
+            LoadBalancerArn:
+                Ref: WebAppLB
+            Port: "80"
+            Protocol: HTTP
+
+    ## Load Balancer Listner Rule ##
+
+    ALBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            Actions:
+                - Type: forward
+                  TargetGroupArn: !Ref "WebAppTargetGroup"
+            Conditions:
+                - Field: path-pattern
+                  Values: [/]
+            ListenerArn: !Ref "Listener"
+            Priority: 1
+
+    ## Target Group ##
+
+    # It checks / path for respose code 200 in every 10 seconds interval
+    WebAppTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 10
+            HealthCheckPath: /
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 8
+            HealthyThresholdCount: 2
+            Port: 80
+            Protocol: HTTP
+            UnhealthyThresholdCount: 5
+            VpcId:
+                Fn::ImportValue:
+                    Fn::Sub: "${EnvironmentName}-VPCID"
+
+Outputs:
+    WebAppLBDNSName:
+        Description: DNS name or Public URL of the Load Balancer
+        Value: !Join ["", ["http://", !GetAtt WebAppLB.DNSName]]
+        Export:
+            Name: !Sub ${EnvironmentName}-LB-DNSName
